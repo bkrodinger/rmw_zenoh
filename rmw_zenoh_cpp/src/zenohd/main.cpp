@@ -18,6 +18,13 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <signal.h>
+#include <unistd.h>
+
+#include <initializer_list>
+#include <functional>
+#include <algorithm>
+#include <iostream>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -37,122 +44,7 @@
 #include "rmw/error_handling.h"
 
 static bool running = true;
-
-class KeyboardReader final
-{
-public:
-  KeyboardReader()
-  {
-#ifdef _WIN32
-    hstdin_ = GetStdHandle(STD_INPUT_HANDLE);
-    if (hstdin_ == INVALID_HANDLE_VALUE) {
-      throw std::runtime_error("Failed to get stdin handle");
-    }
-    if (!GetConsoleMode(hstdin_, &old_mode_)) {
-      throw std::runtime_error("Failed to get old console mode");
-    }
-    DWORD new_mode = ENABLE_PROCESSED_INPUT;  // for Ctrl-C processing
-    if (!SetConsoleMode(hstdin_, new_mode)) {
-      throw std::runtime_error("Failed to set new console mode");
-    }
-#else
-    // get the console in raw mode
-    if (tcgetattr(0, &cooked_) < 0) {
-      throw std::runtime_error("Failed to get old console mode");
-    }
-    struct termios raw;
-    memcpy(&raw, &cooked_, sizeof(struct termios));
-    raw.c_lflag &= ~(ICANON | ECHO);
-    // Setting a new line, then end of file
-    raw.c_cc[VEOL] = 1;
-    raw.c_cc[VEOF] = 2;
-    raw.c_cc[VTIME] = 1;
-    raw.c_cc[VMIN] = 0;
-    if (tcsetattr(0, TCSANOW, &raw) < 0) {
-      throw std::runtime_error("Failed to set new console mode");
-    }
-#endif
-  }
-
-  char readOne()
-  {
-    char c = 0;
-
-#ifdef _WIN32
-    INPUT_RECORD record;
-    DWORD num_read;
-    switch (WaitForSingleObject(hstdin_, 100)) {
-      case WAIT_OBJECT_0:
-        if (!ReadConsoleInput(hstdin_, &record, 1, &num_read)) {
-          throw std::runtime_error("Read failed");
-        }
-
-        if (record.EventType != KEY_EVENT || !record.Event.KeyEvent.bKeyDown) {
-          break;
-        }
-
-        if (record.Event.KeyEvent.wVirtualKeyCode == VK_LEFT) {
-          c = KEYCODE_LEFT;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == VK_UP) {
-          c = KEYCODE_UP;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == VK_RIGHT) {
-          c = KEYCODE_RIGHT;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == VK_DOWN) {
-          c = KEYCODE_DOWN;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x42) {
-          c = KEYCODE_B;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x43) {
-          c = KEYCODE_C;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x44) {
-          c = KEYCODE_D;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x45) {
-          c = KEYCODE_E;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x46) {
-          c = KEYCODE_F;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x47) {
-          c = KEYCODE_G;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x51) {
-          c = KEYCODE_Q;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x52) {
-          c = KEYCODE_R;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x54) {
-          c = KEYCODE_T;
-        } else if (record.Event.KeyEvent.wVirtualKeyCode == 0x56) {
-          c = KEYCODE_V;
-        }
-        break;
-
-      case WAIT_TIMEOUT:
-        break;
-    }
-
-#else
-    int rc = read(0, &c, 1);
-    if (rc < 0) {
-      throw std::runtime_error("read failed");
-    }
-#endif
-
-    return c;
-  }
-
-  ~KeyboardReader()
-  {
-#ifdef _WIN32
-    SetConsoleMode(hstdin_, old_mode_);
-#else
-    tcsetattr(0, TCSANOW, &cooked_);
-#endif
-  }
-
-private:
-#ifdef _WIN32
-  HANDLE hstdin_;
-  DWORD old_mode_;
-#else
-  struct termios cooked_;
-#endif
-};
+static sigset_t   signal_mask;
 
 #ifdef _WIN32
 BOOL WINAPI quit(DWORD ctrl_type)
@@ -169,10 +61,46 @@ void quit(int sig)
 }
 #endif
 
+void *signal_thread(void *arg) {
+  int sig_caught;    
+  int rc;            
+
+  rc = sigwait (&signal_mask, &sig_caught);
+  if (rc != 0) {
+      printf("wooooops\n");
+  }
+  switch (sig_caught)
+  {
+  case SIGINT:
+      running = false;    
+      break;
+  case SIGTERM: 
+      running = false;
+      break;
+  default:      
+      fprintf (stderr, "\nUnexpected signal %d\n", sig_caught);
+      break;
+  }
+}
+
 int main(int argc, char ** argv)
 {
   (void)argc;
   (void)argv;
+
+  pthread_t sig_thread;
+  int rc;
+
+  sigemptyset (&signal_mask);
+  sigaddset (&signal_mask, SIGINT);
+  sigaddset (&signal_mask, SIGTERM);
+  pthread_sigmask(SIG_BLOCK, &signal_mask, nullptr);
+
+
+  rc = pthread_create(&sig_thread, NULL, signal_thread, NULL);
+  if (rc != 0)
+    printf("woops\n");
+  
 
   // Initialize the zenoh configuration for the router.
   z_owned_config_t config;
@@ -189,37 +117,15 @@ int main(int argc, char ** argv)
     printf("Unable to open router session!\n");
     return 1;
   }
-  printf(
+
+    printf(
     "Started Zenoh router with id %s.\n",
     rmw_zenoh_cpp::liveliness::zid_to_str(z_info_zid(z_session_loan(&s))).c_str());
-#ifdef _WIN32
-  SetConsoleCtrlHandler(quit, TRUE);
-#else
-  signal(SIGINT, quit);
-#endif
 
-  KeyboardReader keyreader;
-
-  char c = 0;
-
-  printf("Enter 'q' to quit...\n");
-  while (running) {
-    // get the next event from the keyboard
-    try {
-      c = keyreader.readOne();
-    } catch (const std::runtime_error &) {
-      perror("read():");
-      return -1;
-    }
-
-    if (c == 'q') {
-      break;
-    }
-
+  while(running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
   z_close(z_move(s));
-
   return 0;
 }
