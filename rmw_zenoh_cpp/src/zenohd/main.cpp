@@ -118,10 +118,6 @@ int main(int argc, char ** argv)
     return 1;
   }
 
-    printf(
-    "Started Zenoh router with id %s.\n",
-    rmw_zenoh_cpp::liveliness::zid_to_str(z_info_zid(z_session_loan(&s))).c_str());
-
   while(running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
